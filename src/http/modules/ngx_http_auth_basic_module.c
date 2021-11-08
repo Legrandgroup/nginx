@@ -118,27 +118,6 @@ static ngx_command_t  ngx_http_auth_basic_commands[] = {
       NULL },
 
 /* Taken from https://github.com/samizdatco/nginx-http-auth-digest */
-    { ngx_string("auth_basic_drop_time"),
-      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
-          NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot, NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_auth_basic_loc_conf_t, drop_time),
-      NULL },
-
-    { ngx_string("auth_basic_evasion_time"),
-      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
-          NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot, NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_auth_basic_loc_conf_t, evasion_time),
-      NULL },
-
-    { ngx_string("auth_basic_maxtries"),
-      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
-          NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot, NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_auth_basic_loc_conf_t, maxtries),
-      NULL },
-
     { ngx_string("auth_basic_shm_size"),
       NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1,
       ngx_http_auth_basic_set_shm_size,
@@ -1114,9 +1093,9 @@ ngx_http_auth_basic_create_loc_conf(ngx_conf_t *cf)
     if (conf == NULL) {
         return NULL;
     }
-    conf->drop_time = NGX_CONF_UNSET_UINT;
-    conf->evasion_time = NGX_CONF_UNSET_UINT;
-    conf->maxtries = NGX_CONF_UNSET_UINT;
+    conf->drop_time = NGX_HTTP_AUTH_BASIC_DEFAULT_DROP_TIME;
+    conf->evasion_time = NGX_HTTP_AUTH_BASIC_DEFAULT_EVASION_TIME;
+    conf->maxtries = NGX_HTTP_AUTH_BASIC_DEFAULT_MAXTRIES;
 
     return conf;
 }
@@ -1127,10 +1106,6 @@ ngx_http_auth_basic_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
     ngx_http_auth_basic_loc_conf_t  *prev = parent;
     ngx_http_auth_basic_loc_conf_t  *conf = child;
-
-    ngx_conf_merge_sec_value(conf->drop_time, prev->drop_time, NGX_HTTP_AUTH_BASIC_DEFAULT_DROP_TIME);
-    ngx_conf_merge_sec_value(conf->evasion_time, prev->evasion_time, NGX_HTTP_AUTH_BASIC_DEFAULT_EVASION_TIME);
-    ngx_conf_merge_value(conf->maxtries, prev->maxtries, NGX_HTTP_AUTH_BASIC_DEFAULT_MAXTRIES);
 
     if (conf->realm == NULL) {
         conf->realm = prev->realm;
