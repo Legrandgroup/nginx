@@ -25,11 +25,13 @@
 
 // evasion entries in the rbtree
 typedef struct {
-  ngx_rbtree_node_t node; // the node's .key is derived from the source address
-  time_t drop_time;
-  ngx_int_t failcount;
-  struct sockaddr src_addr;
-  socklen_t src_addrlen;
+    ngx_rbtree_node_t node; // the node's .key is derived from the source address
+    time_t drop_time;
+    ngx_int_t failcount_times_ten; // The number of failed attempts already accounted for, multiplied by 10, so in 0.1 steps.
+                                   // We count by 10% steps because one repeated login/password attempts only counts for 0.1, not for 1 failure.
+    struct sockaddr src_addr;
+    socklen_t src_addrlen;
+    uint32_t last_failed_cred_hash; // The hash of the last attempted credentials that increased the failcount
 } ngx_http_auth_basic_ev_node_t;
 
 typedef struct {
@@ -77,11 +79,12 @@ ngx_rbtree_generic_insert(ngx_rbtree_node_t *temp, ngx_rbtree_node_t *node,
                                          const ngx_rbtree_node_t *right));
 
 static void ngx_http_auth_basic_evasion_tracking(ngx_http_request_t *r,
-    ngx_http_auth_basic_loc_conf_t *alcf, ngx_int_t status);
+    ngx_http_auth_basic_loc_conf_t *alcf, ngx_int_t status, uint32_t cred_hash);
 static int ngx_http_auth_basic_evading(ngx_http_request_t *r,
     ngx_http_auth_basic_loc_conf_t *alcf);
 
 static ngx_int_t ngx_http_auth_basic_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_hash_http_auth_to_uint32(ngx_http_request_t *r, uint32_t *hash);
 static ngx_int_t ngx_http_auth_basic_crypt_handler(ngx_http_request_t *r,
     ngx_str_t *passwd, ngx_str_t *realm);
 static ngx_int_t ngx_http_auth_basic_set_realm(ngx_http_request_t *r,
@@ -191,6 +194,7 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
     ngx_file_t                       file;
     ngx_http_auth_basic_loc_conf_t  *alcf;
     u_char                           buf[NGX_HTTP_AUTH_BUF_SIZE];
+    uint32_t                         user_cred_hash;
     enum {
         sw_login,
         sw_passwd,
@@ -222,19 +226,19 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
                       "no user/password was provided for basic authentication");
 
         ngx_http_auth_basic_evasion_tracking(
-                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE, 0);
         return ngx_http_auth_basic_set_realm(r, &realm);
     }
 
     if (rc == NGX_ERROR) {
         ngx_http_auth_basic_evasion_tracking(
-                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE, 0);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
     if (ngx_http_complex_value(r, &alcf->user_file, &user_file) != NGX_OK) {
         ngx_http_auth_basic_evasion_tracking(
-                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE, 0);
         return NGX_ERROR;
     }
 
@@ -253,7 +257,7 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
         }
 
         ngx_http_auth_basic_evasion_tracking(
-                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                      r, alcf, NGX_HTTP_AUTH_BASIC_STATUS_FAILURE, 0);
         ngx_log_error(level, r->connection->log, err,
                       ngx_open_file_n " \"%s\" failed", user_file.data);
 
@@ -327,9 +331,23 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
                     pwd.data = &buf[passwd];
 
                     ngx_int_t auth_status =  ngx_http_auth_basic_crypt_handler(r, &pwd, &realm);
+                    // User found, password is correct if auth_status==NGX_OK
+                    /* For debug: do not use in product, it dumps passwords to the log!
+                    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                                  "User login %s for credentials \"%s\" (checked against \"%s\")",
+                                  (auth_status == NGX_OK)?"succeeded":"failed",
+                                  r->headers_in.user.data, pwd.data);
+                    */
+                    if (ngx_hash_http_auth_to_uint32(r, &user_cred_hash) != NGX_OK) {
+                        user_cred_hash = 0;
+                    }
                     ngx_http_auth_basic_evasion_tracking(
                                                          r, alcf,
-                                                         (auth_status == NGX_OK)?NGX_HTTP_AUTH_BASIC_STATUS_SUCCESS:NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                                                         (auth_status == NGX_OK)?
+                                                             NGX_HTTP_AUTH_BASIC_STATUS_SUCCESS:
+                                                             NGX_HTTP_AUTH_BASIC_STATUS_FAILURE,
+                                                         user_cred_hash
+                                                        );
                     return auth_status;
                 }
 
@@ -369,9 +387,16 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
         ngx_cpystrn(pwd.data, &buf[passwd], pwd.len + 1);
 
         ngx_int_t auth_status = ngx_http_auth_basic_crypt_handler(r, &pwd, &realm);
+        if (ngx_hash_http_auth_to_uint32(r, &user_cred_hash) != NGX_OK) {
+            user_cred_hash = 0;
+        }
         ngx_http_auth_basic_evasion_tracking(
                                              r, alcf,
-                                             (auth_status == NGX_OK)?NGX_HTTP_AUTH_BASIC_STATUS_SUCCESS:NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                                             (auth_status == NGX_OK)?
+                                                 NGX_HTTP_AUTH_BASIC_STATUS_SUCCESS:
+                                                 NGX_HTTP_AUTH_BASIC_STATUS_FAILURE,
+                                             user_cred_hash
+                                            );
         return auth_status;
     }
 
@@ -381,10 +406,36 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
 
     ngx_http_auth_basic_evasion_tracking(
                                          r, alcf,
-                                         NGX_HTTP_AUTH_BASIC_STATUS_FAILURE);
+                                         NGX_HTTP_AUTH_BASIC_STATUS_FAILURE,
+                                         0
+                                        );
     return ngx_http_auth_basic_set_realm(r, &realm);
 }
 
+
+/**
+ * @brief Hash a user:pwd string into a uint32_t value
+ *
+ * @param r The incoming request
+ * @param[out] hash The resulting uint32_t hash
+ *
+ * @return NGX_OK in case of success, any other value means a failure
+**/
+static ngx_int_t
+ngx_hash_http_auth_to_uint32(ngx_http_request_t *r, uint32_t *hash)
+{
+    ngx_int_t  rc;
+    u_char     *encrypted;
+    
+    static u_char sha_no_salt[] = "{SHA}";
+    rc = ngx_crypt(r->pool, r->headers_in.passwd.data, sha_no_salt, &encrypted);
+    if (rc != NGX_OK || encrypted == NULL) {
+         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    *hash = ngx_crc32_short(encrypted, ngx_strlen(encrypted));
+    ngx_pfree(r->pool, encrypted);
+    return NGX_OK;
+}
 
 static ngx_int_t
 ngx_http_auth_basic_crypt_handler(ngx_http_request_t *r, ngx_str_t *passwd,
@@ -915,13 +966,15 @@ ngx_http_auth_basic_ev_rbtree_find(ngx_http_auth_basic_ev_node_t *this,
  * @param[in] r The HTTP request from the web client
  * @param[in,out] alcf A pointer to the module's local conf structure (context)
  * @param status The current authentication status (success/failure - used to handle statistics accordingly)
+ * @param cred_hash The credentials that lead to @p status, hashed as a uint32_t
  *
  * @note Code taken from https://github.com/samizdatco/nginx-http-auth-digest
 **/
 static void
 ngx_http_auth_basic_evasion_tracking(ngx_http_request_t *r,
                                      ngx_http_auth_basic_loc_conf_t *alcf,
-                                     ngx_int_t status) {
+                                     ngx_int_t status,
+                                     uint32_t cred_hash) {
   ngx_slab_pool_t *shpool;
   ngx_uint_t key;
   ngx_http_auth_basic_ev_node_t testnode, *node;
@@ -970,19 +1023,32 @@ ngx_http_auth_basic_evasion_tracking(ngx_http_request_t *r,
   if (status == NGX_HTTP_AUTH_BASIC_STATUS_SUCCESS) {
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "successful auth, clearing evasion counters");
-    node->failcount = 0;
+    node->failcount_times_ten = 0;
     node->drop_time = ngx_time();
+    node->last_failed_cred_hash = 0; /* Reset the last failed credentials */
   } else {
     // Reset the failure count to 1 if we're outside the evasion window
     if (ngx_time() > node->drop_time) {
-      node->failcount = 1;
+      node->failcount_times_ten = 10; /* 10 here means one full failure */
+      node->last_failed_cred_hash = cred_hash;
     } else {
-      node->failcount += 1;
+      if (node->last_failed_cred_hash == cred_hash) {
+        /* If last failure was on the same login/password, consider this is a retry
+           and thus, do only count this for 1/4 in the failed count */
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "same auth as previous failure, only increasing 1/10");
+        node->failcount_times_ten += 1;
+      }
+      else {
+        // Otherwise increase the failed count to progress toward coutnermeasure (evasion)
+        node->failcount_times_ten += 10; /* One full failure */
+        node->last_failed_cred_hash = cred_hash;
+      }
     }
     node->drop_time = ngx_time() + alcf->evasion_time;
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                  "failed auth, updating failcount=%d, drop_time=%d",
-                  node->failcount, node->drop_time);
+                  "failed auth, updating failcount=%d.%d, drop_time=%d",
+                  node->failcount_times_ten/10, node->failcount_times_ten%10, node->drop_time);
   }
   ngx_shmtx_unlock(&shpool->mutex);
 }
@@ -1018,7 +1084,7 @@ static int ngx_http_auth_basic_evading(ngx_http_request_t *r,
   node = ngx_http_auth_basic_ev_rbtree_find(
       &testnode, ngx_http_auth_basic_ev_rbtree->root,
       ngx_http_auth_basic_ev_rbtree->sentinel);
-  if (node != NULL && node->failcount >= alcf->maxtries &&
+  if (node != NULL && node->failcount_times_ten >= alcf->maxtries*10 &&
       ngx_time() < node->drop_time) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                   "ignoring authentication request - in evasion period");
